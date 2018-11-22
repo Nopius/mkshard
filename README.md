@@ -1,6 +1,8 @@
 # mkshard
 Bash script that prepares and starts mongo cluster locally on RHEL/CentOS/OracleLinux 7.x machine without using docker or kubernetes. Tested it on OracleLinux 7.5
 
+Requires root privileges. TODO: phase out sudo and root privs.
+
 This script can be useful for those who want to run mongo cluster on local machine without using docker images. Main purpose of this project is to prepare and run mongo cluster from scratch (with one command), mostly for running tests on external applications that depends on mongo cluster. Created mongo cluster starts with authentication enabled and can be preconfigured with custom number of shards, replicas, users and roles. 
 
 
