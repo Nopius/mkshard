@@ -70,6 +70,12 @@ set
 
 }
 
+# Run mongo command with parameters
+# $@ - mongo parameters
+function run_mongo(){
+  mongo $@
+}
+
 # Custom stack to rollback changes in case of error
 function push(){
   local _len
@@ -674,13 +680,13 @@ function create_mongorc(){
   local _username _homedir
   pushd .
   _username=${1:-`whoami`} ; shift
-  while [ x$_username != x ]; do
+  while [ x${_username} != x ]; do
     _homedir=`grep "^${_username}:" /etc/passwd | cut -d: -f6`
-    cd $_homedir
-    cat <<EOF > .mongorc
+    cd ${_homedir}
+    cat <<EOF > .mongorc.js
 if (db.runCommand({ isMaster: 1.0 }).msg!='isdbgrid') {
   if (! db.runCommand({ isMaster: 1.0 }).arbiterOnly) {
-    db.getSiblingDB('local').auth('__system', cat('/etc/mongo-secret').replace(/\n| *|  */gim,''));
+    db.getSiblingDB('local').auth('__system', cat('${SECRET_FILE}').replace(/\n| *|  */gim,''));
   };
 }
 else {
@@ -688,7 +694,7 @@ else {
 }
 EOF
 
-  _username=$1 ; shift
+    _username=$1 ; shift
   done
   cd `popd`
 }
@@ -714,7 +720,7 @@ function run_create(){
   create_users_all
   secure_config_mongos
   secure_config_mongod
-  create_mongorc
+  create_mongorc root nopius
 }
 
 function run_destroy(){
@@ -726,7 +732,6 @@ function run_destroy(){
   systemctl reset-failed mongod@${DATA_RS_NAME}\*
   systemctl stop mongod@${CONFIG_RS_NAME}\*
   systemctl disable mongod@${CONFIG_RS_NAME}\*
-  systemctl reset-failed mongod@${CONFIG_RS_NAME}\*
   rm "/usr/lib/systemd/system/mongos@.service"
   rm "/usr/lib/systemd/system/mongod@.service"
   rm -f /etc/mongo-secret 
@@ -735,5 +740,13 @@ function run_destroy(){
   rm -Rf $DATADIR/${DATA_RS_NAME}* $DATADIR/${CONFIG_RS_NAME}* $LOGDIR/mongo*
 }
 
-cmd=run_${1:-create}
-$cmd
+cmd=${1:-create}
+
+case "$cmd" in
+  (create|destroy)
+    run_$cmd
+    ;;
+  *)
+    echo Usage: "$0 create|destroy"
+    ;;
+esac
