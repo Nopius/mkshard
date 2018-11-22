@@ -14,11 +14,42 @@ Sharded Mongo cluster consists of the following components:
 
 USAGE
 
-Usage: sudo ./mkshard {create|destroy}
+Usage: sudo ./mkshard create|destroy
+
   create  - creates and starts MongoDB sharded cluster on localhost
   destroy - stops MongoDB cluster AND DESTROYS ALL DATA
-  
-Default database administrator login/password: admin:admin
+
+Default databases dir: /opt/mongod/
+Default logs dir: /var/log/mongodb/
+Default DBA login/password: admin:admin
+Default mongos port: 27017
+
+There are some 'sleeps' in the script inserted to complete 'primary' member election inside cluster. While creating mongo cluster it may look like 'script hangs', but it is not. On my PC cluster creation (with downloading and installing mongo packages) takes 3m 38s:
+```
+/usr/bin/time sudo ./mkshard create
+Loaded plugins: langpacks, rhnplugin
+This system is receiving updates from RHN Classic or Red Hat Satellite.
+oraclelinux7-x86_64-uekr5                                                                                                   oraclelinux7-x86_64-uekr5/updateinfo                                                                                       oraclelinux7-x86_64-uekr5/primary                                                                                           oraclelinux7-x86_64-uekr5                                                                                                   Percona-Server-MongoDB-34-3.4.16-2.14.el7.x86_64.rpm                                                                       Examining /var/tmp/yum-root-slWagO/Percona-Server-MongoDB-34-3.4.16-2.14.el7.x86_64.rpm: Percona-Server-MongoDB-34-3.4.16-2.14.el7.x86_64
+...
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+{ "ok" : 1 }
+Percona Server for MongoDB shell version v3.4.16-2.14
+connecting to: mongodb://127.0.0.1:27017
+...
+Successfully added user: { "user" : "zabbix_mon", "roles" : [ "monitoringRole" ] }
+6.82user 1.82system 3:38.10elapsed 3%CPU (0avgtext+0avgdata 38220maxresident)k
+3784inputs+201880outputs (32major+491233minor)pagefaults 0swaps
+```
 
 TESTING
 ```
