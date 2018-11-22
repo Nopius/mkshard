@@ -94,7 +94,7 @@ function pop(){
 
 
 function install_packages() {
-    yum install -y --enablerepo=farpost-oraclelinux7-x86_64 numactl http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-mongos-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-server-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-shell-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-tools-3.4.16-2.14.el7.x86_64.rpm
+    yum install -y --enablerepo=* numactl http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-mongos-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-server-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-shell-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-tools-3.4.16-2.14.el7.x86_64.rpm
     # we use our own service names
     systemctl stop mongod
     systemctl disable mongod
