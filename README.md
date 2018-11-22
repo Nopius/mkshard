@@ -23,10 +23,10 @@ Usage: sudo ./mkshard create|destroy
   
   destroy - stops MongoDB cluster AND DESTROYS ALL DATA
 
-Default databases dir: /opt/mongod/
-Default logs dir: /var/log/mongodb/
-Default DBA login/password: admin:admin
-Default mongos port: 27017
+- Default databases dir: /opt/mongod/
+- Default logs dir: /var/log/mongodb/
+- Default DBA login/password: admin:admin
+- Default mongos port: 27017
 
 There are some 'sleeps' in the script inserted to complete 'primary' member election inside cluster. While creating mongo cluster it may look like 'script hangs', but it is not. On my PC cluster creation (with downloading and installing mongo packages) takes 3m 38s:
 ```
