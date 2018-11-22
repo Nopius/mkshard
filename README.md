@@ -18,6 +18,7 @@ Usage: sudo ./mkshard {create|destroy}
   destroy - stops MongoDB cluster AND DESTROYS ALL DATA
   
 TESTING
+```
 mongo --norc -u admin -p admin --authenticationDatabase admin
 Percona Server for MongoDB shell version v3.4.16-2.14
 connecting to: mongodb://127.0.0.1:27017
@@ -48,3 +49,4 @@ NaN
         Migration Results for the last 24 hours: 
                 No recent migrations
   databases:
+```
