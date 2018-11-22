@@ -1,0 +1,739 @@
+#!/bin/bash
+# $1 - {create|destroy}
+# immediate exit on error
+set +e
+
+SECRET_FILE=/etc/mongo-secret
+BASE_PORT=27020
+STANDALONE_PORT_OFFSET=10000
+CONFIG_RS_COUNT=3
+CONFIG_RS_NAME="cfg"
+SHARD_COUNT=3
+DATA_RS_COUNT=3
+DATA_RS_NAME="shard"
+MONGOS_SERVICE_NAME="proxy"
+DATADIR=/opt/mongodb
+LOGDIR=/var/log/mongodb
+POP=""
+# -A - associative array
+declare -A ALL_ROLES
+declare -A ALL_USERS
+# local_users are not on config servers but in the shard local db
+declare -A LOCAL_USERS
+# Undo stack
+declare -a UNDO
+
+# we can pass roles, user and passwords externally via environment variables
+# to pass role 'roleA' use this syntax:
+# ALL_ROLES_roleA='privileges: ..., roles: ...'
+# to pass user 'userB' with role 'roleA':
+# ALL_USERS_userB='roles: [ { "roleA" } ]'
+# to pass user password for 'userB':
+# USER_PASS_userB="password_for_userB"
+function initialize_roles_and_users(){
+  local _pwd _key _value
+  # create default roles
+  ALL_ROLES[adminRole]='"privileges": [ { "resource": { "anyResource" : true }, "actions": [ "anyAction" ] } ], roles: [ "root" ]'
+  ALL_ROLES[monitoringRole]='"privileges" : [ { "resource" : { "db" : "", "collection" : "" }, "actions" : [ "listCollections", "listDatabases" ] } ], "roles" : [ { "role" : "clusterMonitor", "db" : "admin" }, { "role" : "read", "db" : "admin" } ]'
+  ALL_ROLES[backupRole]='"privileges" : [ { "resource" : { "cluster" : true }, "actions" : [ "update" ] }, { "resource" : { "db" : "config", "collection" : "settings" }, "actions" : [ "update" ] } ], "roles" : [ { "role" : "monitoringRole", "db" : "admin" } ]'
+  ALL_ROLES[appRole]='"privileges" : [ { "resource" : { "db" : "", "collection" : "" }, "actions" : [ "update" ] } ] , "roles": [ "readWrite" ] '
+  # define non-default roles or change defaults
+  while IFS='=' read _key _value; do
+      ALL_ROLES[$_key]="$_value"
+  done < <( set | grep ^ALL_ROLES_ | sed -e 's/^ALL_ROLES_//' )
+  # one role per user
+  ALL_USERS[admin]='"roles": [ "adminRole" ]'
+  ALL_USERS[zabbix_mon]='"roles": [ "monitoringRole" ]'
+  ALL_USERS[backup]='"roles": [ "backupRole" ]'
+  ALL_USERS[app]='"roles": [ "appRole" ]'
+  # read non-default users or redefine
+  while IFS='=' read _key _value; do
+      ALL_USERS[$_key]="$_value"
+  done < <( set | grep ^ALL_USERS_ | sed -e 's/^ALL_USERS_//' )
+  # also create local 'admin' database users (not on config servers)
+  # we use only 'key' not value, set the same for convinience
+  LOCAL_USERS[admin]=admin
+  LOCAL_USERS[zabbix_mon]=zabbix_mon
+  LOCAL_USERS[backup]=backup
+  while IFS='=' read _key _value; do
+      LOCAL_USERS[$_key]="$_value"
+  done < <( set | grep ^LOCAL_USERS_ | sed -e 's/^LOCAL_USERS_//' )
+
+  # initialize externally provided passwords (or defaults) and complete ALL_USERS with username and password
+  for u in "${!ALL_USERS[@]}"; do
+    # if not provided externally user password is set to username
+    eval USER_PASS_${u}=\$\{USER_PASS_${u}:-${u}\}
+    eval _pwd=\$USER_PASS_${u}
+    ALL_USERS[$u]="\"pwd\": \"$_pwd\", ${ALL_USERS[$u]}"
+  done
+set
+
+}
+
+# Custom stack to rollback changes in case of error
+function push(){
+  local _len
+  _len=${#UNDO[@]}
+  UNDO[$_len]="$@"
+}
+
+
+# pop array element to the POP value
+# on empty stack return error and empty POP
+
+function pop(){
+  if [ ${#UNDO[@]} = 0 ]; then
+    POP=""
+    return 1
+  else
+    POP="${UNDO[-1]}"
+    unset UNDO[$((${#UNDO[@]}-1))]
+    return 0
+  fi
+}
+
+
+function install_packages() {
+    yum install -y --enablerepo=farpost-oraclelinux7-x86_64 numactl http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-mongos-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-server-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-shell-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-tools-3.4.16-2.14.el7.x86_64.rpm
+    # we use our own service names
+    systemctl stop mongod
+    systemctl disable mongod
+# service not exist
+#    systemctl disable mongos
+#    systemctl stop mongos
+    push $FUNCNAME $@
+}
+
+function rollback_install_packages(){
+  yum remove -y Percona-Server-MongoDB-34-3.4.16-2.14.el7.x86_64 Percona-Server-MongoDB-34-mongos-3.4.16-2.14.el7.x86_64 Percona-Server-MongoDB-34-server-3.4.16-2.14.el7.x86_64 Percona-Server-MongoDB-34-shell-3.4.16-2.14.el7.x86_64 Percona-Server-MongoDB-34-tools-3.4.16-2.14.el7.x86_64
+}
+
+
+function create_mongod_systemd_unit() {
+cat <<-'EOF' > "/usr/lib/systemd/system/mongod@.service"
+[Unit]
+Description=High-performance, schema-free document-oriented database
+After=time-sync.target network.target
+
+[Service]
+Type=forking
+User=mongod
+Group=mongod
+PermissionsStartOnly=true
+EnvironmentFile=/etc/sysconfig/mongod-%i
+ExecStart=/usr/bin/env bash -c "/usr/bin/mongod $OPTIONS"
+# Give more time for WiredTiger recovery upon startup
+TimeoutSec=3600s
+PIDFile=/var/run/mongodb/mongod-%i.pid
+LimitFSIZE=infinity
+LimitCPU=infinity
+LimitAS=infinity
+LimitNOFILE=65536
+LimitNPROC=65536
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+
+EOF
+}
+
+
+function rollback_create_mongod_systemd_unit(){
+  rm "/usr/lib/systemd/system/mongod@.service"
+}
+
+
+function create_mongos_systemd_unit() {
+cat <<'EOF' > "/usr/lib/systemd/system/mongos@.service"
+[Unit]
+Description=High-performance, schema-free document-oriented database
+After=time-sync.target network.target
+
+[Service]
+Type=forking
+User=mongod
+Group=mongod
+PermissionsStartOnly=true
+EnvironmentFile=/etc/sysconfig/mongos-%i
+#ExecStart=/usr/bin/env bash -c "/usr/bin/mongos $OPTIONS"
+ExecStart=/usr/bin/env bash -c "/usr/bin/mongos $OPTIONS"
+PIDFile=/var/run/mongodb/mongos-%i.pid
+LimitFSIZE=infinity
+LimitCPU=infinity
+LimitAS=infinity
+LimitNOFILE=65536
+LimitNPROC=65536
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+push $FUNCNAME $@
+}
+
+
+function rollback_create_mongos_systemd_unit(){
+  rm "/usr/lib/systemd/system/mongos@.service"
+}
+
+
+# full service will look like mongod@shard1-0.service, where shard1 is an rs name, 0 is instance number
+# $1 - instance name == shard name in shareded config
+# $2 - instance number (0,1,... - # of replica in a replica-set)
+# $3 - shard number
+# $4 - {configsvr|shardsvr}, default = shardsvr
+# $5 - [{sharded|standalone}}, default = sharded
+# $6 - [true|false] transition to auth, default = true (allow auth and anonymous connections to cluster)
+
+function create_config_mongod_instance() {
+  local _name _id _shard _type _mode _is_journaling _is_transition
+  _name=$1 ; shift
+  _id=$1   ; shift
+  _shard=$1 ; shift
+  _type=${1:-shardsvr} ; shift
+  _mode=${1:-sharded} ; shift
+  _is_transition=${1:-true} ; shift
+
+  if [ x$_type = xconfigsvr ]; then
+    _is_journaling=true
+  else
+    _is_journaling=false
+  fi
+  
+  if [ $_mode = sharded ] ; then
+     get_port_by_name _port $_type $_id $_shard
+     sharding_section="
+replication:
+  replSetName: $_name
+  oplogSizeMB: 5
+
+sharding:
+  clusterRole: $_type
+"  
+  else
+    get_port_by_name _base_port $_type $_id $_shard
+    _port=$((_base_port+STANDALONE_PORT_OFFSET+_id))
+  fi
+
+  cat <<EOF > /etc/mongod-$_name-$_id.conf
+processManagement:
+  fork: true
+  pidFilePath: /var/run/mongodb/mongod-$_name-$_id.pid
+
+systemLog:
+  destination: file
+  logAppend: true
+  logRotate: reopen
+  path: $LOGDIR/mongod-$_name-$_id.log
+
+storage:
+  dbPath: $DATADIR/$_name-$_id
+  journal:
+    enabled: $_is_journaling
+  syncPeriodSecs: 120
+  directoryPerDB: true
+  engine: wiredTiger
+  wiredTiger:
+    engineConfig:
+      directoryForIndexes: true
+      cacheSizeGB: 0.25
+    collectionConfig:
+      blockCompressor: snappy
+net:
+  port: $_port
+
+operationProfiling:
+  slowOpThresholdMs: 100
+
+$sharding_section
+
+security:
+  transitionToAuth: $_is_transition
+  keyFile: $SECRET_FILE
+
+EOF
+
+cat <<EOF > /etc/sysconfig/mongod-$_name-$_id
+OPTIONS="-f /etc/mongod-$_name-$_id.conf"
+
+EOF
+STDOUT="/dev/null"
+STDERR="/dev/null"
+
+push $FUNCNAME $_name $_id
+}
+
+
+# $1 - instance name == shard name in shareded config
+# $2 - instance number (0,1,... - # of replica in a replica-set)
+function rollback_create_config_mongod_instance(){
+  local _name _id
+  _name=$1 ; shift
+  _id=$1   ; shift
+  rm /etc/sysconfig/mongod-$_name-$_id
+  rm /etc/mongod-$_name-$_id.conf
+}
+
+# $1 - instance name 
+# $2 - configDB, like "cfg/goods-archive-cfg1.akod.loc:27019,goods-archive-cfg2.akod.loc:27019,goods-archive-cfg3.akod.loc:27019"
+# $3 - transitionToAuth [true|false], default true
+function create_config_mongos_instance() {
+    local _name _cfg _is_transition
+    _name=$1 ; shift
+    _cfg=$1  ; shift
+    _is_transition=$1  ; shift
+    get_port_by_name _port mongos
+cat <<EOF > /etc/mongos-$_name.conf
+processManagement:
+  fork: true
+  pidFilePath: /var/run/mongodb/mongos-$_name.pid
+
+systemLog:
+  destination: file
+  logAppend: true
+  logRotate: reopen
+  path: /var/log/mongodb/mongos-$_name.log
+
+net:
+  port: $_port
+
+sharding:
+  configDB: $_cfg
+
+security:
+  transitionToAuth: $_is_transition
+  keyFile: $SECRET_FILE
+EOF
+
+cat <<EOF > /etc/sysconfig/mongos-$_name
+OPTIONS="-f /etc/mongos-$_name.conf"
+STDOUT="/dev/null"
+STDERR="/dev/null"
+
+EOF
+
+  push $FUNCNAME $_name
+ 
+}
+
+function rollback_create_config_mongos_instance(){
+    local _name 
+    _name=$1 ; shift
+    rm /etc/sysconfig/mongos-$_name
+    rm /etc/mongos-$_name.conf
+}
+
+function create_mongo_secret() {
+  openssl rand -base64 756 > $SECRET_FILE
+  chown mongod:mongod $SECRET_FILE
+  chmod 400 $SECRET_FILE
+  push $FUNCNAME
+}
+
+function rollback_create_mongo_secret() {
+  rm $SECRET_FILE
+}
+
+function create_base_dirs() {
+  mkdir -p $DATADIR && chown mongod:mongod $DATADIR
+  mkdir -p $LOGDIR && chown mongod:mongod $LOGDIR
+  mkdir -p /var/run/mongodb && chown mongod:mongod /var/run/mongodb
+  push $FUNCNAME
+}
+
+function rollback_create_base_dirs() {
+  rm -Rf $DATADIR
+  rm -Rf $LOGDIR
+  rm -Rf /var/run/mongodb
+}
+
+
+# $1 - name
+# $2 - id
+# $3 - shard #
+# $4 - {configsvr|shardsvr}
+# $5 - {sharded|standalone}
+function create_mongod_instance() {
+  local _name _id _type _is_sharded
+  _name="$1"       ; shift
+  _id="$1"         ; shift
+  _shard="$1"      ; shift
+  _type="$1"       ; shift
+  _is_sharded="$1" ; shift
+
+  create_config_mongod_instance $_name $_id $_shard $_type $_is_sharded
+
+  mkdir -p "$DATADIR/$_name-$_id"
+  chown mongod:mongod "$DATADIR/$_name-$_id"
+  systemctl enable mongod@$_name-$_id
+  push $FUNCNAME $_name $_id
+}
+
+function rollback_create_mongod_instance() {
+  local _name 
+  _name=$1       ; shift
+  _id=$1       ; shift
+  systemctl disable mongod@$_name-$_id
+# not needed, because rollback should be already on stack
+#  rollback_create_config_mongod_instance $_name $_id $_base_port $_type $_is_sharded
+  rm -Rf $DATADIR/$_name-$_id
+}
+
+# $1 - variable name to assign
+# $2 - {configsvr|shardsvr|mongos}
+# $3 - rs #    (0..) (for config and data)
+# $4 - shard # (0..) (for data only)
+function get_port_by_name(){
+  local _type _rs _shard _var
+  _var=$1   ; shift
+  _type=$1  ; shift
+  case $_type in 
+    mongos)
+        eval $_var=27017
+        ;;
+    configsvr)
+  	_rs=$1    ; shift
+        eval $_var=$((BASE_PORT+_rs))
+        ;;
+    shardsvr)
+  	_rs=$1    ; shift
+	_shard=$1 ; shift
+        eval $_var=$((BASE_PORT+CONFIG_RS_COUNT+_shard*DATA_RS_COUNT+_rs))
+        ;;
+  esac
+  
+}
+
+function create_config_instances(){
+  for i in `seq 0 $((CONFIG_RS_COUNT-1))`; do
+    create_mongod_instance $CONFIG_RS_NAME $i 0 configsvr sharded
+  done 
+  # no push, since non-terminal function
+}
+
+function create_data_instances(){
+  for i in `seq 0 $((SHARD_COUNT-1))`; do
+    for j in `seq 0 $((DATA_RS_COUNT-1))`; do
+      create_mongod_instance ${DATA_RS_NAME}${i} $j $i shardsvr sharded
+    done
+  done 
+  # no push since non-terminal function
+}
+function create_all_instances() {
+  create_config_instances
+  create_data_instances
+  push $FUNCNAME
+}
+function rollback_create_all_instances(){
+  # just reset failed states if any
+  systemctl reset-failed mongod@\*
+}
+
+# $1 - instance name
+function start_mongod_instance(){
+  systemctl start mongod@$1.service
+  push $FUNCNAME $@
+}
+# $1 - instance name
+function stop_mongod_instance(){
+  systemctl stop mongod@$1.service
+}
+
+function rollback_start_mongod_instance(){
+  stop_mongod_instance $1
+}
+
+function start_config_instances(){
+  for i in `seq 0 $((CONFIG_RS_COUNT-1))`; do
+    start_mongod_instance ${CONFIG_RS_NAME}-$i 
+  done 
+}
+
+function start_data_instances(){
+  for i in `seq 0 $((SHARD_COUNT-1))`; do
+    for j in `seq 0 $((DATA_RS_COUNT-1))`; do
+      start_mongod_instance ${DATA_RS_NAME}$i-$j 
+    done
+  done 
+}
+
+# $1 - instance name
+function start_mongos_instance(){
+    systemctl start mongos@$1.service
+    push $FUNCNAME $@
+}
+# $1 - instance name
+function stop_mongos_instance(){
+    systemctl stop mongos@$1.service
+}
+
+# $1 - instance name ('proxy')
+function rollback_start_mongos_instance(){
+    stop_mongos_instance $1
+}
+
+function start_all_instances() {
+  start_config_instances
+  start_data_instances
+}
+
+# $1 - shard #
+# $2 - rs name
+# $3 - rs member count
+# $4 - configsvr
+# OUT: CONFIG_DB variable set for config server
+function init_rs(){
+  local _shard  _rsname _count _localport _is_config _type
+
+  _shard=$1    ; shift
+  _rsname=$1   ; shift
+  _count=$1    ; shift
+  _is_config=$1; shift
+
+  if [ x$_is_config = xtrue ]; then
+    _type=configsvr
+    get_port_by_name _baseport $_type 0 0
+    CONFIG_DB="$_rsname/localhost:$_baseport"
+  else
+    _type=shardsvr
+    get_port_by_name _baseport $_type 0 $_shard
+  fi
+  # force no journalling for data shards
+  mongo --quiet localhost:$_baseport --eval "rs.initiate( { _id: '$_rsname', writeConcernMajorityJournalDefault: $_is_config, configsvr: $_is_config, members: [ { _id : 0, host : 'localhost:$_baseport' } ] })"
+
+  sleep 2 # add time to initialize primary
+  for i in `seq 1 $((_count-1))`; do
+        get_port_by_name _localport $_type $i $_shard
+        mongo --quiet localhost:$_baseport --eval "rs.add('localhost:$_localport')"
+        if [ x$_is_config = xtrue ]; then
+            CONFIG_DB="$CONFIG_DB,localhost:$_localport"
+        fi
+  done
+}
+
+# OUT: CONFIG_DB of already running cluster (as it should be after full initialization)
+function init_config_db_var(){
+  local _localport
+  get_port_by_name _localport configsvr 0 
+  CONFIG_DB="${CONFIG_RS_NAME}/localhost:${_localport}"
+  for i in `seq 1 $((CONFIG_RS_COUNT-1))`; do
+    get_port_by_name _localport configsvr $i
+    CONFIG_DB="$CONFIG_DB,localhost:$_localport"
+  done
+}
+
+function init_all_shards(){
+  local _shard_name
+  for i in `seq 0 $((SHARD_COUNT-1))`; do
+        get_port_by_name _localport shardsvr 0 $i 
+        _shard_name=${DATA_RS_NAME}${i}
+        # one rs member is enough
+        mongo --eval "sh.addShard(\"$_shard_name/localhost:$_localport\")"
+  done
+}
+
+function init_config_rs(){
+  init_rs 0 $CONFIG_RS_NAME $CONFIG_RS_COUNT true
+}
+
+function init_data_rs(){
+  for j in `seq 0 $((SHARD_COUNT-1))`; do
+    init_rs $j ${DATA_RS_NAME}$j $DATA_RS_COUNT false
+  done
+}
+
+# call rollback function
+# $1 - function name
+# [$2 ... ] - function args
+function rollback() {
+  local _name
+  _name=$1 ; shift
+  rollback_${_name} $@
+}
+
+function undo_all(){
+#  set +e
+  local _yn
+  # short circuit defence
+  trap - INT TERM ERR
+  _yn='something'
+  echo -n "ERROR occured, do you want to undo all changes"
+  echo -n "(Y/n)?"
+  read _yn
+  while [ $_yn = 'Y' -o $_yn = 'y' ] && pop ; do
+    # potentially _yn can be chaned inside loop, if we would like
+    echo $?
+    rollback $POP
+  done 
+}
+
+
+# $1 - addr:port #
+# $2 - role name
+# $3 - role definition grants (either roles or privileges or both), read 
+# https://docs.mongodb.com/manual/reference/method/db.createRole/index.html
+# use 'admin' database for all roles
+function create_role(){
+  local _addr _rolename _grants
+  _addr="$1" ; shift
+  _rolename="$1" ; shift
+  _grants="$@" ;  shift
+  mongo $_addr/admin --quiet --eval "db.createRole({\"role\": \"$_rolename\", $_grants })" 
+}
+
+# create role on all shards and on config server
+function create_roles_all(){
+  local k j 
+  # create role through mongos router on config server
+  get_port_by_name _localport configsvr 0 
+  get_primary_by_port _primary $_localport
+
+  for k in "${!ALL_ROLES[@]}"; do
+    create_role $_primary $k "${ALL_ROLES[$k]}"
+  done
+  # create role on mongod local rs masters
+  for j in `seq 0 $((SHARD_COUNT-1))`; do
+    get_port_by_name _localport shardsvr 0 $j
+    get_primary_by_port _primary $_localport
+    for k in "${!ALL_ROLES[@]}"; do
+        create_role $_primary $k "${ALL_ROLES[$k]}"
+    done
+  done
+}
+
+# $1 - var name
+# $2 - port
+function get_primary_by_port(){
+  local _port _master
+  _master=$1 ; shift
+  _port=$1 ; shift
+  eval $_master=`mongo localhost:$_port --quiet --eval 'rs.status().members.filter( function (x) {return x.stateStr === "PRIMARY"})[0].name'`
+}
+
+# $1 - port to connect
+# $2 - user name
+# $3 - user creation params
+function create_user(){
+  local _addr _username _params
+  _addr="$1" ; shift
+  _username="$1" ; shift
+  _params="$@" ;  shift
+echo  mongo $_addr/admin --quiet --eval "db.createUser({\"user\": \"$_username\", $_params })"
+  mongo $_addr/admin --quiet --eval "db.createUser({\"user\": \"$_username\", $_params })"
+  
+}
+
+function create_users_all(){
+  # create users via mongo router
+  get_port_by_name _localport mongos 
+  for k in "${!ALL_USERS[@]}"; do
+    create_user "localhost:$_localport" $k "${ALL_USERS[$k]}"
+  done
+
+  # create (admin/monitoring/backup) users on mongod local rs masters
+  for j in `seq 0 $((SHARD_COUNT-1))`; do
+    get_port_by_name _localport shardsvr 0 $j
+    get_primary_by_port _primary $_localport
+    for k in "${!LOCAL_USERS[@]}"; do
+        create_user $_primary $k "${ALL_USERS[$k]}"
+    done
+  done
+
+}
+
+# change config and restart service with forced auth enabled
+function secure_config_mongos(){
+  stop_mongos_instance ${MONGOS_SERVICE_NAME}
+  init_config_db_var
+  create_config_mongos_instance ${MONGOS_SERVICE_NAME} ${CONFIG_DB} false
+  start_mongos_instance ${MONGOS_SERVICE_NAME}
+}
+
+# force authentication on mongo cluster
+function secure_config_mongod(){
+  # recreate config with transitionToAuth=false and restart instances
+  for i in `seq 0 $((CONFIG_RS_COUNT-1))`; do
+    stop_mongod_instance $CONFIG_RS_NAME-$i
+    sleep 10 # time to vote for new master
+    create_config_mongod_instance $CONFIG_RS_NAME $i 0 configsvr sharded false
+    start_mongod_instance $CONFIG_RS_NAME-$i
+  done
+  for i in `seq 0 $((SHARD_COUNT-1))`; do
+    for j in `seq 0 $((DATA_RS_COUNT-1))`; do
+      stop_mongod_instance  ${DATA_RS_NAME}${i}-$j
+      sleep 10
+      create_config_mongod_instance ${DATA_RS_NAME}${i} $j $i shardsvr sharded false
+      start_mongod_instance  ${DATA_RS_NAME}${i}-$j
+    done
+  done
+}
+
+# [$1, $2, ... ]- username to create .mongorc at home. Optional. Default - current user
+function create_mongorc(){
+  local _username _homedir
+  pushd .
+  _username=${1:-`whoami`} ; shift
+  while [ x$_username != x ]; do
+    _homedir=`grep "^${_username}:" /etc/passwd | cut -d: -f6`
+    cd $_homedir
+    cat <<EOF > .mongorc
+if (db.runCommand({ isMaster: 1.0 }).msg!='isdbgrid') {
+  if (! db.runCommand({ isMaster: 1.0 }).arbiterOnly) {
+    db.getSiblingDB('local').auth('__system', cat('/etc/mongo-secret').replace(/\n| *|  */gim,''));
+  };
+}
+else {
+  db.getSiblingDB('admin').auth('admin', '$USER_PASS_admin');
+}
+EOF
+
+  _username=$1 ; shift
+  done
+  cd `popd`
+}
+
+function run_create(){
+  trap undo_all INT TERM ERR
+  create_base_dirs
+  #install_packages
+  create_mongod_systemd_unit
+  create_mongos_systemd_unit
+  systemctl daemon-reload
+  create_mongo_secret
+  create_all_instances
+  start_config_instances
+  start_data_instances
+  init_config_rs
+  init_data_rs
+  create_config_mongos_instance $MONGOS_SERVICE_NAME $CONFIG_DB true
+  start_mongos_instance $MONGOS_SERVICE_NAME
+  init_all_shards
+  initialize_roles_and_users
+  create_roles_all
+  create_users_all
+  secure_config_mongos
+  secure_config_mongod
+  create_mongorc
+}
+
+function run_destroy(){
+  systemctl stop mongos@${MONGOS_SERVICE_NAME}
+  systemctl disable mongos@${MONGOS_SERVICE_NAME}
+  systemctl reset-failed mongos@${MONGOS_SERVICE_NAME}
+  systemctl stop mongod@${DATA_RS_NAME}\*
+  systemctl disable mongod@${DATA_RS_NAME}\*
+  systemctl reset-failed mongod@${DATA_RS_NAME}\*
+  systemctl stop mongod@${CONFIG_RS_NAME}\*
+  systemctl disable mongod@${CONFIG_RS_NAME}\*
+  systemctl reset-failed mongod@${CONFIG_RS_NAME}\*
+  rm "/usr/lib/systemd/system/mongos@.service"
+  rm "/usr/lib/systemd/system/mongod@.service"
+  rm -f /etc/mongo-secret 
+  rm -f /etc/mongos-${MONGOS_SERVICE_NAME}.conf /etc/sysconfig/mongos-${MONGOS_SERVICE_NAME}
+  rm -f /etc/mongod-${DATA_RS_NAME}*.conf /etc/mongod-${CONFIG_RS_NAME}*.conf /etc/sysconfig/mongod-${DATA_RS_NAME}-*
+  rm -Rf $DATADIR/${DATA_RS_NAME}* $DATADIR/${CONFIG_RS_NAME}* $LOGDIR/mongo*
+}
+
+cmd=run_${1:-create}
+$cmd
