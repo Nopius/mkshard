@@ -13,10 +13,13 @@ Sharded Mongo cluster consists of the following components:
 - shards (usually 2 or more), thats themselves are replica-sets, which keep partial data
 
 USAGE
+
 Usage: sudo ./mkshard {create|destroy}
   create  - creates and starts MongoDB sharded cluster on localhost
   destroy - stops MongoDB cluster AND DESTROYS ALL DATA
   
+Default database administrator login/password: admin:admin
+
 TESTING
 ```
 mongo --norc -u admin -p admin --authenticationDatabase admin
