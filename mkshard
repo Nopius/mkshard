@@ -4,16 +4,18 @@
 set +e
 
 SECRET_FILE=/etc/mongo-secret
-BASE_PORT=27020
-STANDALONE_PORT_OFFSET=10000
-CONFIG_RS_COUNT=3
-CONFIG_RS_NAME="cfg"
-SHARD_COUNT=3
-DATA_RS_COUNT=3
-DATA_RS_NAME="shard"
-MONGOS_SERVICE_NAME="proxy"
-DATADIR=/opt/mongodb
-LOGDIR=/var/log/mongodb
+MONGO_USER=${MONGO_USER:-mongod}
+BASE_PORT=${BASE_PORT:-27020}
+STANDALONE_PORT_OFFSET=${STANDALONE_PORT_OFFSET:-10000}
+CONFIG_RS_COUNT=${CONFIG_RS_COUNT:-3}
+CONFIG_RS_NAME=${CONFIG_RS_NAME:-"cfg"}
+SHARD_COUNT=${SHARD_COUNT:-3}
+DATA_RS_COUNT=${DATA_RS_COUNT:-3}
+DATA_RS_NAME=${DATA_RS_NAME:-"shard"}
+MONGOS_SERVICE_NAME=${MONGOS_SERVICE_NAME:-"proxy"}
+DATADIR=${DATADIR:-/opt/mongodb}
+LOGDIR=${LOGDIR:-/var/log/mongodb}
+WITH_SYSTEMD=${WITH_SYSTEMD:-""}
 POP=""
 # -A - associative array
 declare -A ALL_ROLES
@@ -30,14 +32,14 @@ declare -a UNDO
 # ALL_USERS_userB='roles: [ { "roleA" } ]'
 # to pass user password for 'userB':
 # USER_PASS_userB="password_for_userB"
-function initialize_roles_and_users(){
+function init_roles_and_users(){
   local _pwd _key _value
   # create default roles
   ALL_ROLES[adminRole]='"privileges": [ { "resource": { "anyResource" : true }, "actions": [ "anyAction" ] } ], roles: [ "root" ]'
   ALL_ROLES[monitoringRole]='"privileges" : [ { "resource" : { "db" : "", "collection" : "" }, "actions" : [ "listCollections", "listDatabases" ] } ], "roles" : [ { "role" : "clusterMonitor", "db" : "admin" }, { "role" : "read", "db" : "admin" } ]'
   ALL_ROLES[backupRole]='"privileges" : [ { "resource" : { "cluster" : true }, "actions" : [ "update" ] }, { "resource" : { "db" : "config", "collection" : "settings" }, "actions" : [ "update" ] } ], "roles" : [ { "role" : "monitoringRole", "db" : "admin" } ]'
-  ALL_ROLES[appRole]='"privileges" : [ { "resource" : { "db" : "", "collection" : "" }, "actions" : [ "update" ] } ] , "roles": [ "readWrite" ] '
-  # define non-default roles or change defaults
+  ALL_ROLES[appRole]='"privileges" : [ { "resource" : { "db" : "", "collection" : "" }, "actions" : [ "update" ] } ] , "roles": [ "readWriteAnyDatabase" ] '
+  # define non-default roles or change defaults (read environment variables and reassign)
   while IFS='=' read _key _value; do
       ALL_ROLES[$_key]="$_value"
   done < <( set | grep ^ALL_ROLES_ | sed -e 's/^ALL_ROLES_//' )
@@ -101,12 +103,6 @@ function pop(){
 
 function install_packages() {
     yum install -y --enablerepo=* numactl http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-mongos-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-server-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-shell-3.4.16-2.14.el7.x86_64.rpm http://repo.percona.com/release/7Server/RPMS/x86_64/Percona-Server-MongoDB-34-tools-3.4.16-2.14.el7.x86_64.rpm
-    # we use our own service names
-    systemctl stop mongod
-    systemctl disable mongod
-# service not exist
-#    systemctl disable mongos
-#    systemctl stop mongos
     push $FUNCNAME $@
 }
 
@@ -115,7 +111,8 @@ function rollback_install_packages(){
 }
 
 
-function create_mongod_systemd_unit() {
+function create_mongod_service_script() {
+  if [ x$WITH_SYSTEMD != x ] ; then
 cat <<-'EOF' > "/usr/lib/systemd/system/mongod@.service"
 [Unit]
 Description=High-performance, schema-free document-oriented database
@@ -142,15 +139,77 @@ Restart=on-failure
 WantedBy=multi-user.target
 
 EOF
+  else
+    create_mongod_init_script
+  fi
 }
 
+# if we want to manage mongod without systemd (i.e. inside container)
+function create_mongod_init_script(){
+cat <<-'EOF' > "/etc/init.d/mongod"
+#!/bin/bash 
+# $0 script name format: mongod-?1-?2
+# where ?1 - shard name
+#       ?2 - replica number
+INST_NAME=${0##*/}
+SERVICE=${INST_NAME%%-*}
+source /etc/sysconfig/$INST_NAME
 
-function rollback_create_mongod_systemd_unit(){
+# $1 - cmd line options
+function get_running_pid(){
+    ps -axo pid,cmd | grep "/usr/bin/$SERVICE $@"| grep -v grep | awk '{print $1}'
+}
+function get_saved_pid(){
+    [ -r /var/run/mongodb/$INST_NAME.pid ] && cat /var/run/mongodb/$INST_NAME.pid
+}
+
+rcode=0
+case $1 in
+  start)
+    su -p -c "/usr/bin/$SERVICE $OPTIONS" \
+EOF
+echo $MONGO_USER >> /etc/init.d/mongod
+cat <<-'EOF' >> "/etc/init.d/mongod"
+    running_pid=`get_running_pid "$OPTIONS"`
+    saved_pid=`get_saved_pid`
+    if [ x$running_pid != x$saved_pid ]; then
+      rcode=1
+    fi
+    ;;
+  stop)
+    kill `get_running_pid "$OPTIONS"`
+    ;;
+  status)
+    running_pid=`get_running_pid "$OPTIONS"`
+    expected_pid=`get_saved_pid`
+    if [ x$running_pid = x ]; then
+      if [ x$expected_pid != x ]; then
+        echo Not running, pid file exists.
+        rcode=1
+      else
+        echo Not running.
+        rcode=1
+      fi
+    elif [ x$running_pid = x$expected_pid ]; then
+        echo Running.
+    else
+        echo Running. Pid file bad.
+    fi
+    ;;
+esac
+exit $rcode
+
+EOF
+  chmod +x /etc/init.d/mongod
+}
+
+function rollback_create_mongod_service_script(){
   rm "/usr/lib/systemd/system/mongod@.service"
 }
 
 
-function create_mongos_systemd_unit() {
+function create_mongos_service_script() {
+  if [ x$WITH_SYSTEMD != x ] ; then
 cat <<'EOF' > "/usr/lib/systemd/system/mongos@.service"
 [Unit]
 Description=High-performance, schema-free document-oriented database
@@ -175,11 +234,12 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 EOF
+  fi
 push $FUNCNAME $@
 }
 
 
-function rollback_create_mongos_systemd_unit(){
+function rollback_create_mongos_service_script(){
   rm "/usr/lib/systemd/system/mongos@.service"
 }
 
@@ -285,7 +345,7 @@ function rollback_create_config_mongod_instance(){
 # $2 - configDB, like "cfg/goods-archive-cfg1.akod.loc:27019,goods-archive-cfg2.akod.loc:27019,goods-archive-cfg3.akod.loc:27019"
 # $3 - transitionToAuth [true|false], default true
 function create_config_mongos_instance() {
-    local _name _cfg _is_transition
+    local _name _cfg _is_transition _port
     _name=$1 ; shift
     _cfg=$1  ; shift
     _is_transition=$1  ; shift
@@ -332,7 +392,7 @@ function rollback_create_config_mongos_instance(){
 
 function create_mongo_secret() {
   openssl rand -base64 756 > $SECRET_FILE
-  chown mongod:mongod $SECRET_FILE
+  chown $MONGO_USER:$MONGO_USER $SECRET_FILE
   chmod 400 $SECRET_FILE
   push $FUNCNAME
 }
@@ -342,9 +402,9 @@ function rollback_create_mongo_secret() {
 }
 
 function create_base_dirs() {
-  mkdir -p $DATADIR && chown mongod:mongod $DATADIR
-  mkdir -p $LOGDIR && chown mongod:mongod $LOGDIR
-  mkdir -p /var/run/mongodb && chown mongod:mongod /var/run/mongodb
+  mkdir -p $DATADIR && chown $MONGO_USER:$MONGO_USER $DATADIR
+  mkdir -p $LOGDIR && chown $MONGO_USER:$MONGO_USER $LOGDIR
+  mkdir -p /var/run/mongodb && chown $MONGO_USER:$MONGO_USER /var/run/mongodb
   push $FUNCNAME
 }
 
@@ -371,8 +431,12 @@ function create_mongod_instance() {
   create_config_mongod_instance $_name $_id $_shard $_type $_is_sharded
 
   mkdir -p "$DATADIR/$_name-$_id"
-  chown mongod:mongod "$DATADIR/$_name-$_id"
-  systemctl enable mongod@$_name-$_id
+  chown $MONGO_USER:$MONGO_USER "$DATADIR/$_name-$_id"
+  if [ x$WITH_SYSTEMD != x ]; then
+    systemctl enable mongod@$_name-$_id
+  else
+    ln -f /etc/init.d/mongod /etc/init.d/mongod-$_name-$_id
+  fi
   push $FUNCNAME $_name $_id
 }
 
@@ -380,7 +444,11 @@ function rollback_create_mongod_instance() {
   local _name 
   _name=$1       ; shift
   _id=$1       ; shift
-  systemctl disable mongod@$_name-$_id
+  if [ x$WITH_SYSTEMD != x ]; then
+    systemctl disable mongod@$_name-$_id
+  else
+    rm /etc/init.d/mongod-$_name-$_id
+  fi
 # not needed, because rollback should be already on stack
 #  rollback_create_config_mongod_instance $_name $_id $_base_port $_type $_is_sharded
   rm -Rf $DATADIR/$_name-$_id
@@ -426,9 +494,24 @@ function create_data_instances(){
   done 
   # no push since non-terminal function
 }
+function create_mongos_instances(){
+  local _mongos_name
+  for _mongos_name in $MONGOS_SERVICE_NAME; do
+    init_config_db_var
+    create_config_mongos_instance "$_mongos_name" "$CONFIG_DB" true
+
+    if [ x$WITH_SYSTEMD != x ]; then
+      systemctl enable mongos@$_mongos_name
+    else
+      ln -f /etc/init.d/mongod /etc/init.d/mongos-$_mongos_name
+    fi
+  done
+}
+
 function create_all_instances() {
   create_config_instances
   create_data_instances
+  create_mongos_instances
   push $FUNCNAME
 }
 function rollback_create_all_instances(){
@@ -438,12 +521,20 @@ function rollback_create_all_instances(){
 
 # $1 - instance name
 function start_mongod_instance(){
-  systemctl start mongod@$1.service
+  if [ x$WITH_SYSTEMD != x ]; then
+    systemctl start mongod@$1.service
+  else
+    /etc/init.d/mongod-$1 start
+  fi
   push $FUNCNAME $@
 }
 # $1 - instance name
 function stop_mongod_instance(){
-  systemctl stop mongod@$1.service
+  if [ x$WITH_SYSTEMD != x ]; then
+    systemctl stop mongod@$1.service
+  else
+    /etc/init.d/mongod-$1 stop
+  fi
 }
 
 function rollback_start_mongod_instance(){
@@ -466,12 +557,20 @@ function start_data_instances(){
 
 # $1 - instance name
 function start_mongos_instance(){
-    systemctl start mongos@$1.service
+    if [ x$WITH_SYSTEMD != x ]; then
+      systemctl start mongos@$1.service
+    else # only name differs
+      /etc/init.d/mongos-$1 start
+    fi
     push $FUNCNAME $@
 }
 # $1 - instance name
 function stop_mongos_instance(){
-    systemctl stop mongos@$1.service
+    if [ x$WITH_SYSTEMD != x ]; then
+      systemctl stop mongos@$1.service
+    else
+      /etc/init.d/mongos-$1 stop
+    fi
 }
 
 # $1 - instance name ('proxy')
@@ -482,6 +581,10 @@ function rollback_start_mongos_instance(){
 function start_all_instances() {
   start_config_instances
   start_data_instances
+}
+
+function start_mongos_instances(){
+  start_mongos_instance $MONGOS_SERVICE_NAME
 }
 
 # $1 - shard #
@@ -650,10 +753,13 @@ function create_users_all(){
 
 # change config and restart service with forced auth enabled
 function secure_config_mongos(){
-  stop_mongos_instance ${MONGOS_SERVICE_NAME}
-  init_config_db_var
-  create_config_mongos_instance ${MONGOS_SERVICE_NAME} ${CONFIG_DB} false
-  start_mongos_instance ${MONGOS_SERVICE_NAME}
+  local _mongos_name
+  for _mongos_name in $MONGOS_SERVICE_NAME; do
+    stop_mongos_instance $_mongos_name
+    init_config_db_var
+    create_config_mongos_instance "$_mongos_name" "${CONFIG_DB}" false
+    start_mongos_instance $_mongos_name
+  done
 }
 
 # force authentication on mongo cluster
@@ -661,14 +767,14 @@ function secure_config_mongod(){
   # recreate config with transitionToAuth=false and restart instances
   for i in `seq 0 $((CONFIG_RS_COUNT-1))`; do
     stop_mongod_instance $CONFIG_RS_NAME-$i
-    sleep 10 # time to vote for new master
+    sleep 2 # time to vote for new master
     create_config_mongod_instance $CONFIG_RS_NAME $i 0 configsvr sharded false
     start_mongod_instance $CONFIG_RS_NAME-$i
   done
   for i in `seq 0 $((SHARD_COUNT-1))`; do
     for j in `seq 0 $((DATA_RS_COUNT-1))`; do
       stop_mongod_instance  ${DATA_RS_NAME}${i}-$j
-      sleep 10
+      sleep 2
       create_config_mongod_instance ${DATA_RS_NAME}${i} $j $i shardsvr sharded false
       start_mongod_instance  ${DATA_RS_NAME}${i}-$j
     done
@@ -701,21 +807,22 @@ EOF
 
 function run_create(){
   trap undo_all INT TERM ERR
+#  install_packages
   create_base_dirs
-  #install_packages
-  create_mongod_systemd_unit
-  create_mongos_systemd_unit
-  systemctl daemon-reload
+  create_mongod_service_script
+  create_mongos_service_script
+  if [ x$WITH_SYSTEMD != x ]; then
+    systemctl daemon-reload
+  fi
   create_mongo_secret
   create_all_instances
   start_config_instances
   start_data_instances
   init_config_rs
   init_data_rs
-  create_config_mongos_instance $MONGOS_SERVICE_NAME $CONFIG_DB true
-  start_mongos_instance $MONGOS_SERVICE_NAME
+  start_mongos_instances
   init_all_shards
-  initialize_roles_and_users
+  init_roles_and_users
   create_roles_all
   create_users_all
   secure_config_mongos
@@ -724,20 +831,30 @@ function run_create(){
 }
 
 function run_destroy(){
-  systemctl stop mongos@${MONGOS_SERVICE_NAME}
-  systemctl disable mongos@${MONGOS_SERVICE_NAME}
-  systemctl reset-failed mongos@${MONGOS_SERVICE_NAME}
-  systemctl stop mongod@${DATA_RS_NAME}\*
-  systemctl disable mongod@${DATA_RS_NAME}\*
-  systemctl reset-failed mongod@${DATA_RS_NAME}\*
-  systemctl stop mongod@${CONFIG_RS_NAME}\*
-  systemctl disable mongod@${CONFIG_RS_NAME}\*
-  rm "/usr/lib/systemd/system/mongos@.service"
-  rm "/usr/lib/systemd/system/mongod@.service"
+  if [ x$WITH_SYSTEMD != x ]; then
+    systemctl stop mongos@${MONGOS_SERVICE_NAME}
+    systemctl disable mongos@${MONGOS_SERVICE_NAME}
+    systemctl stop mongod@${DATA_RS_NAME}\*
+    systemctl disable mongod@${DATA_RS_NAME}\*
+    systemctl reset-failed mongod@${DATA_RS_NAME}\*
+    systemctl stop mongod@${CONFIG_RS_NAME}\*
+    systemctl disable mongod@${CONFIG_RS_NAME}\*
+    rm "/usr/lib/systemd/system/mongos@.service"
+    rm "/usr/lib/systemd/system/mongod@.service"
+    rm -f /etc/sysconfig/mongod-${DATA_RS_NAME}-*
+  else
+    for svc in /etc/init.d/mongos-* /etc/init.d/mongod-*; do
+      $svc stop && rm $svc
+    done
+    rm /etc/init.d/mongod
+  fi
+  # wait for directory close before remove
+  sleep 5
   rm -f /etc/mongo-secret 
   rm -f /etc/mongos-${MONGOS_SERVICE_NAME}.conf /etc/sysconfig/mongos-${MONGOS_SERVICE_NAME}
-  rm -f /etc/mongod-${DATA_RS_NAME}*.conf /etc/mongod-${CONFIG_RS_NAME}*.conf /etc/sysconfig/mongod-${DATA_RS_NAME}-*
+  rm -f /etc/mongod-${DATA_RS_NAME}*.conf /etc/mongod-${CONFIG_RS_NAME}*.conf 
   rm -Rf $DATADIR/${DATA_RS_NAME}* $DATADIR/${CONFIG_RS_NAME}* $LOGDIR/mongo*
+  rm -f /tmp/mongodb-*.sock
 }
 
 cmd=${1:-create}
