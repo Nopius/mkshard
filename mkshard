@@ -72,12 +72,6 @@ set
 
 }
 
-# Run mongo command with parameters
-# $@ - mongo parameters
-function run_mongo(){
-  mongo $@
-}
-
 # Custom stack to rollback changes in case of error
 function push(){
   local _len
@@ -166,7 +160,7 @@ function get_saved_pid(){
 rcode=0
 case $1 in
   start)
-    su -p -c "/usr/bin/$SERVICE $OPTIONS" \
+    su -s /bin/bash -c "/usr/bin/$SERVICE $OPTIONS" \
 EOF
 echo $MONGO_USER >> /etc/init.d/mongod
 cat <<-'EOF' >> "/etc/init.d/mongod"
@@ -583,9 +577,6 @@ function start_all_instances() {
   start_data_instances
 }
 
-function start_mongos_instances(){
-  start_mongos_instance $MONGOS_SERVICE_NAME
-}
 
 # $1 - shard #
 # $2 - rs name
@@ -717,7 +708,7 @@ function get_primary_by_port(){
   local _port _master
   _master=$1 ; shift
   _port=$1 ; shift
-  eval $_master=`mongo localhost:$_port --quiet --eval 'rs.status().members.filter( function (x) {return x.stateStr === "PRIMARY"})[0].name'`
+  eval $_master=`mongo localhost:$_port --quiet --eval 'rs.slaveOk(); rs.status().members.filter( function (x) {return x.stateStr === "PRIMARY"})[0].name'`
 }
 
 # $1 - port to connect
@@ -758,6 +749,20 @@ function secure_config_mongos(){
     stop_mongos_instance $_mongos_name
     init_config_db_var
     create_config_mongos_instance "$_mongos_name" "${CONFIG_DB}" false
+    start_mongos_instance $_mongos_name
+  done
+}
+
+function stop_mongos_instances(){
+  local _mongos_name
+  for _mongos_name in $MONGOS_SERVICE_NAME; do
+    stop_mongos_instance $_mongos_name
+  done
+}
+
+function start_mongos_instances(){
+  local _mongos_name
+  for _mongos_name in $MONGOS_SERVICE_NAME; do
     start_mongos_instance $_mongos_name
   done
 }
@@ -807,7 +812,8 @@ EOF
 
 function run_create(){
   trap undo_all INT TERM ERR
-#  install_packages
+  # installing from Dockerfile
+  # install_packages
   create_base_dirs
   create_mongod_service_script
   create_mongos_service_script
@@ -827,7 +833,8 @@ function run_create(){
   create_users_all
   secure_config_mongos
   secure_config_mongod
-  create_mongorc root nopius
+  create_mongorc root mongod
+  stop_mongos_instances
 }
 
 function run_destroy(){
