@@ -2,6 +2,7 @@
 # $1 - {create|destroy}
 # immediate exit on error
 set +e
+set -x
 
 SECRET_FILE=/etc/mongo-secret
 MONGO_USER=${MONGO_USER:-mongod}
@@ -63,10 +64,13 @@ function init_roles_and_users(){
 
   # initialize externally provided passwords (or defaults) and complete ALL_USERS with username and password
   for u in "${!ALL_USERS[@]}"; do
-    # if not provided externally user password is set to username
-    eval USER_PASS_${u}=\$\{USER_PASS_${u}:-${u}\}
-    eval _pwd=\$USER_PASS_${u}
-    ALL_USERS[$u]="\"pwd\": \"$_pwd\", ${ALL_USERS[$u]}"
+    # We can disable predefined 'user' if we assign ALL_USERS[user]="" empty sting
+    if [ x"${ALL_USERS[$u]}" != x ]; then
+      # if not provided externally user password is set to username
+      eval USER_PASS_${u}=\$\{USER_PASS_${u}:-${u}\}
+      eval _pwd=\$USER_PASS_${u}
+      ALL_USERS[$u]="\"pwd\": \"$_pwd\", ${ALL_USERS[$u]}"
+    fi
   done
 set
 
@@ -338,15 +342,17 @@ function rollback_create_config_mongod_instance(){
 # $1 - instance name 
 # $2 - configDB, like "cfg/goods-archive-cfg1.akod.loc:27019,goods-archive-cfg2.akod.loc:27019,goods-archive-cfg3.akod.loc:27019"
 # $3 - transitionToAuth [true|false], default true
+# $4 - if we should fork or not [true|false], usefull for container entrypoint, default true
 function create_config_mongos_instance() {
-    local _name _cfg _is_transition _port
+    local _name _cfg _is_transition _port _fork
     _name=$1 ; shift
     _cfg=$1  ; shift
-    _is_transition=$1  ; shift
+    _is_transition=${1:-true} ; shift
+    _fork=${1:-true} ; shift
     get_port_by_name _port mongos
 cat <<EOF > /etc/mongos-$_name.conf
 processManagement:
-  fork: true
+  fork: $_fork
   pidFilePath: /var/run/mongodb/mongos-$_name.pid
 
 systemLog:
@@ -492,7 +498,7 @@ function create_mongos_instances(){
   local _mongos_name
   for _mongos_name in $MONGOS_SERVICE_NAME; do
     init_config_db_var
-    create_config_mongos_instance "$_mongos_name" "$CONFIG_DB" true
+    create_config_mongos_instance "$_mongos_name" "$CONFIG_DB" true true
 
     if [ x$WITH_SYSTEMD != x ]; then
       systemctl enable mongos@$_mongos_name
@@ -748,8 +754,15 @@ function secure_config_mongos(){
   for _mongos_name in $MONGOS_SERVICE_NAME; do
     stop_mongos_instance $_mongos_name
     init_config_db_var
-    create_config_mongos_instance "$_mongos_name" "${CONFIG_DB}" false
+    create_config_mongos_instance "$_mongos_name" "${CONFIG_DB}" false true
     start_mongos_instance $_mongos_name
+  done
+}
+function config_mongos_disable_fork(){
+  local _mongos_name
+  for _mongos_name in $MONGOS_SERVICE_NAME; do
+    init_config_db_var
+    create_config_mongos_instance "$_mongos_name" "${CONFIG_DB}" false false
   done
 }
 
@@ -833,8 +846,7 @@ function run_create(){
   create_users_all
   secure_config_mongos
   secure_config_mongod
-  create_mongorc root mongod
-  stop_mongos_instances
+  create_mongorc root $MONGO_USER
 }
 
 function run_destroy(){
