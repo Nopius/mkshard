@@ -177,6 +177,10 @@ cat <<-'EOF' >> "/etc/init.d/mongod"
   stop)
     kill `get_running_pid "$OPTIONS"`
     ;;
+  restart)
+    $0 stop 
+    $0 start
+    ;;
   status)
     running_pid=`get_running_pid "$OPTIONS"`
     expected_pid=`get_saved_pid`
@@ -537,6 +541,14 @@ function stop_mongod_instance(){
   fi
 }
 
+function restart_mongod_instance(){
+  if [ x$WITH_SYSTEMD != x ]; then
+    systemctl restart mongod@$1.service
+  else
+    /etc/init.d/mongod-$1 restart
+  fi
+}
+
 function rollback_start_mongod_instance(){
   stop_mongod_instance $1
 }
@@ -555,6 +567,14 @@ function start_data_instances(){
   done 
 }
 
+function restart_mongos_instance(){
+    if [ x$WITH_SYSTEMD != x ]; then
+      systemctl restart mongos@$1.service
+    else # only name differs
+      /etc/init.d/mongos-$1 restart
+    fi
+    push $FUNCNAME $@
+}
 # $1 - instance name
 function start_mongos_instance(){
     if [ x$WITH_SYSTEMD != x ]; then
@@ -590,7 +610,7 @@ function start_all_instances() {
 # $4 - configsvr
 # OUT: CONFIG_DB variable set for config server
 function init_rs(){
-  local _shard  _rsname _count _localport _is_config _type
+  local _shard  _rsname _count _localport _is_config _type _primary
 
   _shard=$1    ; shift
   _rsname=$1   ; shift
@@ -607,15 +627,16 @@ function init_rs(){
   fi
   # force no journalling for data shards
   mongo --quiet localhost:$_baseport --eval "rs.initiate( { _id: '$_rsname', writeConcernMajorityJournalDefault: $_is_config, configsvr: $_is_config, members: [ { _id : 0, host : 'localhost:$_baseport' } ] })"
-
-  sleep 2 # add time to initialize primary
+  sleep 3
   for i in `seq 1 $((_count-1))`; do
         get_port_by_name _localport $_type $i $_shard
-        mongo --quiet localhost:$_baseport --eval "rs.add('localhost:$_localport')"
+        get_primary_by_port _primary $_localport
+        mongo --quiet localhost:$_primary --eval "rs.add('localhost:$_localport')" 
         if [ x$_is_config = xtrue ]; then
             CONFIG_DB="$CONFIG_DB,localhost:$_localport"
         fi
   done
+  sleep 3
 }
 
 # OUT: CONFIG_DB of already running cluster (as it should be after full initialization)
@@ -635,8 +656,9 @@ function init_all_shards(){
         get_port_by_name _localport shardsvr 0 $i 
         _shard_name=${DATA_RS_NAME}${i}
         # one rs member is enough
-        mongo --eval "sh.addShard(\"$_shard_name/localhost:$_localport\")"
+        mongo --eval "sh.addShard(\"$_shard_name/localhost:$_localport\")" 
   done
+  sleep 3
 }
 
 function init_config_rs(){
@@ -703,9 +725,10 @@ function create_roles_all(){
     get_port_by_name _localport shardsvr 0 $j
     get_primary_by_port _primary $_localport
     for k in "${!ALL_ROLES[@]}"; do
-        create_role $_primary $k "${ALL_ROLES[$k]}"
+        create_role $_primary $k "${ALL_ROLES[$k]}" &
     done
   done
+  builtin wait
 }
 
 # $1 - var name
@@ -734,7 +757,7 @@ function create_users_all(){
   # create users via mongo router
   get_port_by_name _localport mongos 
   for k in "${!ALL_USERS[@]}"; do
-    create_user "localhost:$_localport" $k "${ALL_USERS[$k]}"
+    create_user "localhost:$_localport" $k "${ALL_USERS[$k]}" &
   done
 
   # create (admin/monitoring/backup) users on mongod local rs masters
@@ -742,9 +765,10 @@ function create_users_all(){
     get_port_by_name _localport shardsvr 0 $j
     get_primary_by_port _primary $_localport
     for k in "${!LOCAL_USERS[@]}"; do
-        create_user $_primary $k "${ALL_USERS[$k]}"
+        create_user $_primary $k "${ALL_USERS[$k]}" &
     done
   done
+  builtin wait
 
 }
 
@@ -784,17 +808,13 @@ function start_mongos_instances(){
 function secure_config_mongod(){
   # recreate config with transitionToAuth=false and restart instances
   for i in `seq 0 $((CONFIG_RS_COUNT-1))`; do
-    stop_mongod_instance $CONFIG_RS_NAME-$i
-    sleep 2 # time to vote for new master
     create_config_mongod_instance $CONFIG_RS_NAME $i 0 configsvr sharded false
-    start_mongod_instance $CONFIG_RS_NAME-$i
+    restart_mongod_instance $CONFIG_RS_NAME-$i  
   done
   for i in `seq 0 $((SHARD_COUNT-1))`; do
     for j in `seq 0 $((DATA_RS_COUNT-1))`; do
-      stop_mongod_instance  ${DATA_RS_NAME}${i}-$j
-      sleep 2
       create_config_mongod_instance ${DATA_RS_NAME}${i} $j $i shardsvr sharded false
-      start_mongod_instance  ${DATA_RS_NAME}${i}-$j
+      restart_mongod_instance  ${DATA_RS_NAME}${i}-$j
     done
   done
 }

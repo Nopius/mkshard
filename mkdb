@@ -4,6 +4,8 @@
 # $1 - database name to shard (create sharded)
 # $2 ... - collection(s) to shard in the database (create sharded by _id: hashed)
 
+set -x
+
 DB=$1  ; shift
 COL=$1 ; shift
 

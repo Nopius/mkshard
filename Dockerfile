@@ -7,4 +7,5 @@ RUN yum install -y procps-ng util-linux openssl numactl Percona-Server-MongoDB-3
 EXPOSE 27017/tcp
 ADD mkshard mkshard
 ADD mkdb mkdb
-ENTRYPOINT [ "/usr/bin/mongos -f /etc/mongos-proxy.conf" ]
+ADD entrypoint.sh entrypoint.sh
+ENTRYPOINT [ "/entrypoint.sh" ]
