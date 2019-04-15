@@ -1,16 +1,199 @@
 #!/bin/bash
 # Enable database sharding, run this script after 'mkshard'
 # Make sharded collection(s) by _id:hashed key
-# $1 - database name to shard (create sharded)
-# $2 ... - collection(s) to shard in the database (create sharded by _id: hashed)
+# $1 - database name (create sharded)
+# $2 - collection to shard in the database (create sharded by _id: hashed)
+# $3 - sharding index:
+#    if after collection name there are xxx:yyy this argument is treated as necessety to create index on field xxx of type yyy, example "_id:hashed"
+#    if after collection name there is aaa:bbb,ccc:ddd[,...] option, then create composite index on fields aaa and ccc, example 'name:1,family:-1", build complex index (name, family)
+#    if after collection name there is xxx:yyy;aaa:bbb[;ccc:ddd...], then aaa:bbb treated as parameters for index creation, example: "dateTime:1;expireAfterSeconds:3600"
+# [$4...] ... - other indexes (optional):
+# [$(4+N)...] ... - other collections with possible indexes
+#
+# example
+# $0 library books _id:hashed _id:1 author:1 price:-1 authors _id:hashed last_name:1,first_name:1 history _id:hashed expireDate:1;expireAfterSeconds:2630000
+# - create 1 database: 'library'
+# - create 3 collections: 'books', 'authors', 'history'
+# - 'books' collection:
+#    create sharded index _id:hashed
+#    create index   _id:1    (ascending)
+#    create index   author:1 (ascending)
+#    create index   price:-1 (descending)
+# - 'authors' collection:
+#    create sharded index _id:hashed
+#    create composite index (last_name:1, first_name:1)
+# - 'history' collection:
+#    create sharded index _id:hashed
+#    create TTL index on expireDate field with expiration == 1 month (2630000 seconds)
 
-set -x
+
+#set -x
+
+# Log message
+# $1 - level
+# $2 - message
+function log() {
+  local _lvl _msg
+  _lvl=$1 ; shift
+  echo $@
+}
+
+# IN: $1 - variable name to assign value
+#     $2 - string to parse, i.e. "aaa:bbb[,ccc:ddd[,...]][;xxx:yyy[,zzz]]"
+# OUT: $1 is assigned to JSON of index part { aaa : bbb [, ccc : ddd ]}
+# return 0 if successfully identified at least one index
+# return 1 if syntax is OK but no indexes found
+# return 1 if syntax incorrect
+function getarg_index_json(){
+  local _var _input _idxtail _idx _idxname _idxorder _idx_value _retcode _json
+  _var=$1 ; shift
+  _input=$1 ; shift
+  _retcode=0; # default return code
+  _json=""
+  _idxtail=${_input%%;*}
+   # split by ,
+  _idx=${_idxtail%%,*}    # '%%' remove longest match suffix
+  _idxtail=${_idxtail#*,} # '#' remove shortest match prefix
+  [ "$_idxtail" = "$_idx" ] && _idxtail="" 
+  while [ $_retcode = 0 -a x$_idx != x ]; do
+    # now split by ":"
+    _idx_name=${_idx%%:*}
+    _idx_type=${_idx##*:}
+    case "$_idx_type" in
+      (1|-1) : # OK, raw value
+         _idx_value=$_idx_type
+         ;;
+      (hashed) : # OK, escaped value
+         _idx_value="\\\"$_idx_type\\\""
+         ;;
+      *) log ERROR "Unrecognized index type: $_idx"
+         _retcode=1
+         ;;
+    esac
+    if [ $_retcode = 0 ] ; then
+      if [ -z "$_idx_name" ];
+      then
+        log ERROR "Index name cannot be empty: $_idx"
+        _retcode=1
+      else
+        if [ -z "$_json" ]; then
+          _json="{ \\\"$_idx_name\\\":$_idx_value"
+        else
+          _json="$_json, \\\"$_idx_name\\\":$_idx_value"
+        fi
+      fi
+    fi
+    _idx=${_idxtail%%,*}   
+    _idxtail=${_idxtail#*,}
+    [ "$_idxtail" = "$_idx" ] && _idxtail="" 
+  done
+  if [ -n "$_json" ]; then
+    _json="$_json }"
+    eval "$_var=\"$_json\""
+  else
+    _retcode=1
+  fi
+  return $_retcode
+}
+
+# IN: $1 - variable name to assign
+#     $2 - string to parse
+# OUT: $1 is assigned to json if optional part { xxx : yyy [, zzz]}
+function getarg_index_params_json(){
+  local _var _input _ptail _p _pname _pvalue _pvalue2 _retcode
+  _var=$1 ; shift
+  _input=$1 ; shift
+  _ptail=${_input##*;}
+  _retcode=0
+  [ "$_input" = "$_ptail" ] && _retcode=1
+
+   # split by ,
+  _p=${_ptail%%,*}    # '%%' remove longest match suffix
+  _ptail=${_ptail#*,} # '#' remove shortest match prefix
+  [ "$_p" = "$_ptail" ] && _ptail="" 
+  while [ $_retcode = 0 -a x$_p != x ]; do
+    # now split by ":"
+    _pname=${_p%%:*}
+    _pvalue=${_p##*:}
+    case "$_pname" in
+      (background|unique|sparse) : # OK with boolean value
+         case "$_pvalue" in
+           (true|false) 
+             _pvalue2="$_p_value"
+             ;;
+           *)
+             log ERORR "Boolean value expected: $_p"
+             _retcode=1
+             ;;
+         esac
+         ;;
+      (name) : # OK escaped string
+         _pvalue2="\\\"$_pvalue\\\""
+         ;;
+      (expireAfterSeconds) : # OK raw number
+         _pvalue2="$_pvalue"
+         ;;
+      (partialFilterExpression|storageEngine|collation) : # Document type, we don't support
+           log ERROR "Option not supported: $_p"
+           _retcode=1
+         ;;
+      *)
+         log ERROR "Unrecognized option: $_p"
+         _retcode=1
+         ;;
+    esac
+
+    if [ $_retcode = 0 ]
+    then
+      if [ -z "$_json" ]; then
+        _json="{ \\\"$_pname\\\":$_pvalue2"
+      else
+        _json="$_json, \\\"$_pname\\\":$_pvalue2"
+      fi
+    fi
+    _p=${_ptail%%,*}   
+    _ptail=${_ptail#*,}
+    [ "$_p" = "$_ptail" ] && _ptail="" 
+  done
+  if [ -n "$_json" ]; then
+    _json="$_json }"
+    eval "$_var=\"$_json\""
+  else
+    _retcode=1
+  fi
+  return $_retcode
+}
 
 DB=$1  ; shift
 COL=$1 ; shift
+SHIND=$1 ; shift
 
-mongo --norc --eval "load(\"$HOME/.mongorc.js\"); sh.enableSharding(\"$DB\")"
-while [ "$COL" != "" ]; do
-  mongo --norc --eval "load(\"$HOME/.mongorc.js\"); sh.shardCollection(\"$DB.$COL\", { \"_id\":\"hashed\" }, false)"
+if [ -n "$DB" ]; then
+  echo mongo --norc --eval "load(\"$HOME/.mongorc.js\"); sh.enableSharding(\"$DB\")"
+fi
+
+if ! getarg_index_json idx $SHIND ; then
+    log ERROR "required argument for sharded index"
+    exit 1
+else
+    if getarg_index_params_json params $SHIND; then
+      echo mongo --norc --eval "load(\"$HOME/.mongorc.js\"); db.$COL.createIndex($idx, $params)"
+    else
+      echo mongo --norc --eval "load(\"$HOME/.mongorc.js\"); db.$COL.createIndex($idx)"
+    fi
+    echo mongo --norc --eval "load(\"$HOME/.mongorc.js\"); sh.shardCollection(\"$DB.$COL\", $idx)"
+    SHIND=$1 ; shift
+fi
+
+while [ "$SHIND" != "" ]; do
+  while getarg_index_json idx $SHIND ; do # more indexes to create for the same collection
+    if getarg_index_params_json params $SHIND; then
+      echo mongo --norc --eval "load(\"$HOME/.mongorc.js\"); db.$COL.createIndex($idx, $params)"
+    else
+      echo mongo --norc --eval "load(\"$HOME/.mongorc.js\"); db.$COL.createIndex($idx)"
+    fi
+    SHIND=$1 ; shift
+  done
   COL=$1 ; shift
+  SHIND=$1 ; shift
 done
